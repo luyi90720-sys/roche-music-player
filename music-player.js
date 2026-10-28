@@ -3,6 +3,8 @@
 
   // ==================== 调试日志收集（APK/移动端排查用） ====================
   var debugLogs = [];
+  var consoleCapture = null;
+
   function pushDebug(level, args) {
     var parts = Array.prototype.map.call(args || [], function (a) {
       if (typeof a === 'string') return a;
@@ -12,20 +14,39 @@
     debugLogs.push(line);
     if (debugLogs.length > 500) debugLogs.shift();
   }
-  try {
-    var _origLog = window.console.log.bind(window.console);
-    var _origWarn = window.console.warn.bind(window.console);
-    var _origErr = window.console.error.bind(window.console);
-    window.console.log = function () { pushDebug('LOG', arguments); _origLog.apply(null, arguments); };
-    window.console.warn = function () { pushDebug('WARN', arguments); _origWarn.apply(null, arguments); };
-    window.console.error = function () { pushDebug('ERR', arguments); _origErr.apply(null, arguments); };
-    window.addEventListener('error', function (e) {
-      pushDebug('WINERR', [e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0)]);
-    });
-  } catch (e) {}
+
+  // 只在 App 打开期间接管 console，关闭/卸载时恢复宿主原始 console。
+  // 这样调试面板仍可用，又不会永久污染宿主和其它插件。
+  function installConsoleCapture() {
+    if (consoleCapture || !window.console) return;
+    try {
+      var origLog = window.console.log;
+      var origWarn = window.console.warn;
+      var origErr = window.console.error;
+      var onWindowError = function (e) {
+        pushDebug('WINERR', [e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0)]);
+      };
+      window.console.log = function () { pushDebug('LOG', arguments); origLog.apply(window.console, arguments); };
+      window.console.warn = function () { pushDebug('WARN', arguments); origWarn.apply(window.console, arguments); };
+      window.console.error = function () { pushDebug('ERR', arguments); origErr.apply(window.console, arguments); };
+      window.addEventListener('error', onWindowError);
+      consoleCapture = { origLog: origLog, origWarn: origWarn, origErr: origErr, onWindowError: onWindowError };
+    } catch (e) {}
+  }
+
+  function restoreConsoleCapture() {
+    if (!consoleCapture) return;
+    try {
+      window.console.log = consoleCapture.origLog;
+      window.console.warn = consoleCapture.origWarn;
+      window.console.error = consoleCapture.origErr;
+      window.removeEventListener('error', consoleCapture.onWindowError);
+    } catch (e) {}
+    consoleCapture = null;
+  }
 
   // ==================== 全局状态 ====================
-  var BUILD_TIME = '2026-08-08-v3.5.0';
+  var BUILD_TIME = '2026-10-28-v3.5.1';
   var STATE = {
     roche: null,              // roche API 实例
     audio: null,              // 单个 HTMLAudioElement 实例
@@ -93,6 +114,11 @@
     islandPlaylistSongsCache: {},
     // 夜间模式
     themeDark: false,
+    // 最近一次 blob 播放的 Object URL（彻底清理时释放）
+    lastBlobUrl: null,
+    // 账号凭据最近一次落盘值，避免重复写 IndexedDB
+    _savedCookie: null,
+    _savedProfile: null,
     initialized: false
   };
 
@@ -534,6 +560,11 @@
           });
         }
         var objUrl = URL.createObjectURL(blob);
+        // 释放上一首的 blob URL，避免长时间使用后内存堆积
+        if (STATE.lastBlobUrl) {
+          try { URL.revokeObjectURL(STATE.lastBlobUrl); } catch (e) {}
+        }
+        STATE.lastBlobUrl = objUrl;
         STATE.audio.src = objUrl;
         var p = STATE.audio.play();
         if (p && typeof p.then === 'function') {
@@ -3358,6 +3389,8 @@
         </div>\
         <button class="rmp-btn rmp-save-settings-btn" style="margin-top:8px;">保存设置</button>\
         <button class="rmp-btn rmp-btn-secondary rmp-reset-island-btn" style="margin-top:6px;">重置灵动岛显示</button>\
+        <button class="rmp-btn rmp-btn-secondary rmp-clear-account-btn" style="margin-top:6px;">清除已保存的网易云账号</button>\
+        <button class="rmp-btn rmp-btn-secondary rmp-destroy-all-btn" style="margin-top:6px;">停止播放并清理插件</button>\
         <div style="text-align:center;font-size:11px;color:var(--rmp-text-tertiary);margin-top:10px;" class="rmp-version-display">' + BUILD_TIME + '</div>\
         <div class="rmp-debug-block">\
           <div class="rmp-debug-header">\
@@ -3443,6 +3476,8 @@
       islandScrollModeSelect: root.querySelector('.rmp-island-scroll-mode-select'),
       saveSettingsBtn: root.querySelector('.rmp-save-settings-btn'),
       resetIslandBtn: root.querySelector('.rmp-reset-island-btn'),
+      clearAccountBtn: root.querySelector('.rmp-clear-account-btn'),
+      destroyAllBtn: root.querySelector('.rmp-destroy-all-btn'),
       lyricsFullToggle: root.querySelector('.rmp-lyrics-full-toggle'),
       themeToggle: root.querySelector('.rmp-theme-toggle'),
       closeBtn: root.querySelector('.rmp-close-btn'),
@@ -3759,7 +3794,7 @@
           var profile = data.profile || {};
           if (profile.userId) {
             STATE.userProfile = { userId: profile.userId, nickname: profile.nickname, avatarUrl: profile.avatarUrl, vipType: profile.vipType };
-            STATE.roche.storage.set('rmp_user_profile', JSON.stringify(STATE.userProfile));
+            credSet('profile', JSON.stringify(STATE.userProfile));
             updateNeteaseLoginUI();
             if (STATE.roche && STATE.roche.ui) STATE.roche.ui.toast('Cookie 验证成功：' + profile.nickname);
           } else {
@@ -3797,6 +3832,57 @@
       saveSettings();
       if (STATE.roche && STATE.roche.ui) STATE.roche.ui.toast('灵动岛已恢复显示');
     });
+
+    // ===== 清除已保存的网易云账号 =====
+    function clearAccountNow() {
+      STATE.cookie = '';
+      STATE.userProfile = null;
+      credDelete('cookie');
+      credDelete('profile');
+      try {
+        if (STATE.roche && STATE.roche.storage) {
+          STATE.roche.storage.delete('rmp_cookie');
+          STATE.roche.storage.delete('rmp_user_profile');
+        }
+      } catch (e) {}
+      if (refs.cookieInput) refs.cookieInput.value = '';
+      STATE._savedCookie = '';
+      STATE._savedProfile = '';
+      updateNeteaseLoginUI();
+      if (STATE.roche && STATE.roche.ui) STATE.roche.ui.toast('已清除本机保存的网易云账号');
+    }
+    function onClearAccount() {
+      var ui = STATE.roche && STATE.roche.ui;
+      if (ui && typeof ui.confirm === 'function') {
+        ui.confirm({ title: '清除账号', message: '将删除本机保存的网易云 Cookie 和用户资料，不影响 Roche 其它数据。确定吗？' })
+          .then(function (ok) { if (ok) clearAccountNow(); });
+      } else {
+        clearAccountNow();
+      }
+    }
+    if (refs.clearAccountBtn) {
+      refs.clearAccountBtn.addEventListener('click', onClearAccount);
+      STATE.appCleanups.push(function () { refs.clearAccountBtn.removeEventListener('click', onClearAccount); });
+    }
+
+    // ===== 停止播放并清理插件 =====
+    function onDestroyAll() {
+      var ui = STATE.roche && STATE.roche.ui;
+      var run = function () {
+        destroyAll();
+        if (ui && typeof ui.closeApp === 'function') ui.closeApp();
+      };
+      if (ui && typeof ui.confirm === 'function') {
+        ui.confirm({ title: '停止播放并清理', message: '会停止播放，并释放灵动岛、音频和事件监听。播放列表与设置会保留。确定吗？' })
+          .then(function (ok) { if (ok) run(); });
+      } else {
+        run();
+      }
+    }
+    if (refs.destroyAllBtn) {
+      refs.destroyAllBtn.addEventListener('click', onDestroyAll);
+      STATE.appCleanups.push(function () { refs.destroyAllBtn.removeEventListener('click', onDestroyAll); });
+    }
 
     // 灵动岛设置
     function onIslandTopInput() {
@@ -4589,7 +4675,8 @@
               }
               if (dd.nickname) {
                 STATE.userProfile = { nickname: dd.nickname, avatarUrl: dd.avatarUrl || '' };
-                if (STATE.roche && STATE.roche.storage) STATE.roche.storage.set('rmp_user_profile', JSON.stringify(STATE.userProfile));
+                if (STATE.roche && STATE.roche.storage) credSet('profile', JSON.stringify(STATE.userProfile));
+                if (STATE.roche && STATE.roche.storage) { try { STATE.roche.storage.delete('rmp_user_profile'); } catch (e) {} }
               }
               updateNeteaseLoginUI();
               qrStatus.textContent = '登录成功！';
@@ -4602,7 +4689,8 @@
                 var p = acc && (acc.profile || {});
                 if (p && p.nickname) {
                   STATE.userProfile = { nickname: p.nickname, avatarUrl: p.avatarUrl || '', vipType: p.vipType || 0, userId: p.userId };
-                  if (STATE.roche && STATE.roche.storage) STATE.roche.storage.set('rmp_user_profile', JSON.stringify(STATE.userProfile));
+                  if (STATE.roche && STATE.roche.storage) credSet('profile', JSON.stringify(STATE.userProfile));
+                  if (STATE.roche && STATE.roche.storage) { try { STATE.roche.storage.delete('rmp_user_profile'); } catch (e) {} }
                   updateNeteaseLoginUI();
                 }
               }).catch(function () {});
@@ -4734,6 +4822,145 @@
     }
     STATE.appContainer = null;
     STATE.appRefs = {};
+
+    // App 关闭后不再接管宿主 console
+    restoreConsoleCapture();
+  }
+
+  // 彻底停止并释放插件占用的资源：停止播放、销毁灵动岛、移除全局监听与定时器。
+  // 用于「停止播放并清理」按钮和插件卸载（onUnload）。
+  function destroyAll() {
+    // 1. App 面板
+    cleanupApp();
+
+    // 2. 扫码轮询 / 可见性监听
+    if (STATE.qrPollTimer) {
+      clearInterval(STATE.qrPollTimer);
+      STATE.qrPollTimer = null;
+    }
+    if (STATE.qrVisHandler) {
+      document.removeEventListener('visibilitychange', STATE.qrVisHandler);
+      STATE.qrVisHandler = null;
+    }
+
+    // 3. 灵动岛
+    try { destroyIsland(); } catch (e) {}
+
+    // 4. 音频与 blob URL
+    if (STATE.audio) {
+      try { STATE.audio.pause(); } catch (e) {}
+      STATE.audioCleanups.forEach(function (fn) { try { fn(); } catch (e) {} });
+      STATE.audioCleanups = [];
+      try {
+        STATE.audio.removeAttribute('src');
+        STATE.audio.load();
+      } catch (e) {}
+      STATE.audio = null;
+    }
+    if (STATE.lastBlobUrl) {
+      try { URL.revokeObjectURL(STATE.lastBlobUrl); } catch (e) {}
+      STATE.lastBlobUrl = null;
+    }
+
+    // 5. 残留弹层
+    var leftovers = document.querySelectorAll('.rmp-qr-modal, #rmp-add-to-pl-modal, .rmp-island-playlist-popup');
+    for (var i = 0; i < leftovers.length; i++) {
+      try { leftovers[i].remove(); } catch (e) {}
+    }
+
+    // 6. 系统媒体信息
+    if (navigator.mediaSession) {
+      try { navigator.mediaSession.metadata = null; } catch (e) {}
+    }
+
+    // 7. 日志捕获
+    restoreConsoleCapture();
+
+    // 8. 运行状态复位（不清除已保存的设置和播放列表）
+    STATE.islandClosed = false;
+    STATE.islandVisible = true;
+    STATE.isPlaying = false;
+    STATE.currentSong = null;
+    STATE.currentIndex = -1;
+    STATE.justSwitched = null;
+    STATE.initialized = false;
+    STATE._settingsLoaded = false;
+    STATE._popupVisible = false;
+  }
+
+  // ==================== 账号凭据存储（与 Roche 主存储隔离） ====================
+  // 账号 Cookie / 用户资料不再写入 roche.storage。
+  // 原因：roche.storage 属于宿主数据，Roche 的导出、云同步或后端推送会把它一起带走；
+  // 后端如果没有登记这些 key，就会导致推送失败。
+  // 这里改用插件自己的 IndexedDB，宿主同步链路不会读取它。
+  var CRED_DB_NAME = 'roche-plugin-music-player';
+  var CRED_STORE_NAME = 'credentials';
+  var credDbPromise = null;
+
+  function openCredDb() {
+    if (credDbPromise) return credDbPromise;
+    credDbPromise = new Promise(function (resolve) {
+      try {
+        if (!window.indexedDB) return resolve(null);
+        var req = window.indexedDB.open(CRED_DB_NAME, 1);
+        req.onupgradeneeded = function () {
+          var db = req.result;
+          if (!db.objectStoreNames.contains(CRED_STORE_NAME)) db.createObjectStore(CRED_STORE_NAME);
+        };
+        req.onsuccess = function () { resolve(req.result); };
+        req.onerror = function () { resolve(null); };
+        req.onblocked = function () { resolve(null); };
+      } catch (e) { resolve(null); }
+    });
+    return credDbPromise;
+  }
+
+  function credGet(key) {
+    return openCredDb().then(function (db) {
+      if (!db) return '';
+      return new Promise(function (resolve) {
+        try {
+          var tx = db.transaction(CRED_STORE_NAME, 'readonly');
+          var req = tx.objectStore(CRED_STORE_NAME).get(key);
+          req.onsuccess = function () { resolve(req.result || ''); };
+          req.onerror = function () { resolve(''); };
+        } catch (e) { resolve(''); }
+      });
+    });
+  }
+
+  function credSet(key, value) {
+    return openCredDb().then(function (db) {
+      if (!db) return false;
+      return new Promise(function (resolve) {
+        try {
+          var tx = db.transaction(CRED_STORE_NAME, 'readwrite');
+          var store = tx.objectStore(CRED_STORE_NAME);
+          if (value) store.put(value, key);
+          else store.delete(key);
+          tx.oncomplete = function () { resolve(true); };
+          tx.onerror = function () { resolve(false); };
+          tx.onabort = function () { resolve(false); };
+        } catch (e) { resolve(false); }
+      });
+    });
+  }
+
+  function credDelete(key) {
+    return credSet(key, '');
+  }
+
+  // 把旧版本写在 roche.storage 里的账号数据迁移到插件独立库，迁移成功后再删旧 key
+  function migrateLegacyCredentials(roche, legacyCookie, legacyProfile) {
+    if (!roche || !roche.storage) return;
+    if (!legacyCookie && !legacyProfile) return;
+    Promise.all([
+      legacyCookie ? credSet('cookie', legacyCookie) : Promise.resolve(true),
+      legacyProfile ? credSet('profile', legacyProfile) : Promise.resolve(true)
+    ]).then(function (ok) {
+      if (ok[0] && legacyCookie) { try { roche.storage.delete('rmp_cookie'); } catch (e) {} }
+      if (ok[1] && legacyProfile) { try { roche.storage.delete('rmp_user_profile'); } catch (e) {} }
+    });
   }
 
   // ==================== 存储管理 ====================
@@ -4757,6 +4984,7 @@
   }
 
   // 保存设置到 roche.storage（顺序调用，避免并发导致持久化失败）
+  // 账号 Cookie / 用户资料单独写入插件自己的 IndexedDB，不进入宿主同步数据。
   function saveSettings() {
     if (!STATE.roche || !STATE.roche.storage) return;
     try {
@@ -4770,13 +4998,21 @@
       STATE.roche.storage.set('rmp_theme_dark', STATE.themeDark ? '1' : '0');
       STATE.roche.storage.set('rmp_agreed_disclaimer', '1');
       STATE.roche.storage.set('rmp_netease_api_base', STATE.neteaseApiBase || '');
-      // 无条件写入 cookie/userProfile：退出登录时 STATE.cookie='' 也要落盘清空，避免旧值残留
-      STATE.roche.storage.set('rmp_cookie', STATE.cookie || '');
-      STATE.roche.storage.set('rmp_user_profile', STATE.userProfile ? JSON.stringify(STATE.userProfile) : '');
+      // 账号凭据：值没变就不重复写，避免拖动音量时频繁开事务
+      var cookieStr = STATE.cookie || '';
+      var profileStr = STATE.userProfile ? JSON.stringify(STATE.userProfile) : '';
+      if (cookieStr !== STATE._savedCookie) {
+        STATE._savedCookie = cookieStr;
+        credSet('cookie', cookieStr);
+      }
+      if (profileStr !== STATE._savedProfile) {
+        STATE._savedProfile = profileStr;
+        credSet('profile', profileStr);
+      }
     } catch (e) {}
   }
 
-  // 从 roche.storage 加载设置
+  // 从 roche.storage 加载设置；账号凭据从插件独立 IndexedDB 读取并自动迁移旧数据
   function loadSettings(roche) {
     if (!roche || !roche.storage) return Promise.resolve();
     return Promise.all([
@@ -4793,14 +5029,39 @@
       roche.storage.get('rmp_extended_sources'),
       roche.storage.get('rmp_lyrics_full_inject'),
       roche.storage.get('rmp_netease_api_base'),
-      roche.storage.get('rmp_theme_dark')
+      roche.storage.get('rmp_theme_dark'),
+      credGet('cookie'),
+      credGet('profile')
     ]).then(function (results) {
       if (results[0]) STATE.quality = results[0];
       if (results[1]) STATE.volume = parseFloat(results[1]) || 0.8;
       if (results[2]) STATE.playMode = results[2];
-      if (results[3]) STATE.cookie = results[3];
-      // 恢复用户信息（JSON）
-      if (results[4]) { try { STATE.userProfile = JSON.parse(results[4]); } catch (e) {} }
+
+      // 账号凭据：优先读插件独立库；没有则从旧版 roche.storage 迁移
+      var legacyCookie = results[3] || '';
+      var legacyProfile = results[4] || '';
+      var idbCookie = results[14] || '';
+      var idbProfile = results[15] || '';
+      if (idbCookie) {
+        STATE.cookie = idbCookie;
+      } else if (legacyCookie) {
+        STATE.cookie = legacyCookie;
+      }
+      if (idbProfile) {
+        try { STATE.userProfile = JSON.parse(idbProfile); } catch (e) {}
+      } else if (legacyProfile) {
+        try { STATE.userProfile = JSON.parse(legacyProfile); } catch (e) {}
+      }
+      // 只有独立库里没有值时，才把旧值迁过去；否则旧值会把新值覆盖
+      migrateLegacyCredentials(roche, idbCookie ? '' : legacyCookie, idbProfile ? '' : legacyProfile);
+      // 独立库已有新值，旧 key 直接删除，避免继续被宿主同步/推送
+      if (idbCookie && legacyCookie) { try { roche.storage.delete('rmp_cookie'); } catch (e) {} }
+      if (idbProfile && legacyProfile) { try { roche.storage.delete('rmp_user_profile'); } catch (e) {} }
+      // 旧版本遗留的后端地址 key，已不再使用，顺手清掉
+      try { roche.storage.delete('rmp_backend'); } catch (e) {}
+      STATE._savedCookie = STATE.cookie || '';
+      STATE._savedProfile = STATE.userProfile ? JSON.stringify(STATE.userProfile) : '';
+
       if (results[5]) {
         var t = parseInt(results[5], 10);
         if (!isNaN(t)) STATE.islandTop = Math.max(0, Math.min(100, t));
@@ -4933,6 +5194,7 @@
 
       mount: function (container, roche) {
         STATE.roche = roche;
+        installConsoleCapture();
         renderApp(container);
         // 关键：在 mount 时初始化音频引擎、灵动岛（参考 xhs-reader）
         // 不依赖 onLoad，因为 Roche 可能不调用 onLoad
@@ -5059,9 +5321,8 @@
     },
 
     onUnload: function () {
-      // 注意：不在这里销毁灵动岛/音频
-      // 参考 xhs-reader：插件被禁用后，灵动岛继续运行
-      // 用户想真正停止时，通过灵动岛的关闭按钮
+      // 插件被卸载/禁用时彻底释放：停止播放、销毁灵动岛、移除监听和定时器。
+      destroyAll();
     }
   });
 })();

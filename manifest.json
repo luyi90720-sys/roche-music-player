@@ -1,10 +1,10 @@
 {
   "id": "roche-music-player",
   "name": "网易云音乐",
-  "version": "3.5.0",
-  "description": "v3.5.0：网易云歌单不再覆盖播放列表 - 歌单与播放列表独立+歌单缓存+手动刷新",
+  "version": "3.5.1",
+  "description": "v3.5.1：账号凭据移出 Roche 主存储（修复与后端推送的冲突）、console 不再永久接管、补全卸载清理",
   "author": "Roche",
-  "entry": "https://cdn.jsdelivr.net/gh/luyi90720-sys/roche-music-player@85840c3/music-player.js",
+  "entry": "https://cdn.jsdelivr.net/gh/luyi90720-sys/roche-music-player@main/music-player.js",
   "hash": "",
-  "permissions": ["storage", "ui", "memory:read"]
+  "permissions": ["storage", "ui"]
 }
